@@ -155,3 +155,43 @@ def test_installs_are_stamped_against_their_interpreter(tmp_path, monkeypatch):
     )
     assert deps.ensure(requirements) is True, "a different interpreter must install"
     assert ran
+
+
+def test_build_output_is_streamed_while_the_command_runs():
+    """Downloading torch takes minutes; the client must not stare at a dead
+    terminal, unable to tell a slow download from a hung pod."""
+    said = []
+    script = (
+        "import sys, time\n"
+        "for i in range(3):\n"
+        "    print('step', i, flush=True)\n"
+        "    time.sleep(0.05)\n"
+    )
+    bootstrap._run([sys.executable, "-c", script], said.append, "testing", quiet_for=0.0)
+
+    text = "".join(said)
+    assert "testing..." in text
+    assert "step 0" in text and "step 2" in text
+
+
+def test_a_failed_build_step_reports_what_the_command_said():
+    said = []
+    script = "import sys; print('could not resolve torch==9.9.9'); sys.exit(1)"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bootstrap._run([sys.executable, "-c", script], said.append, "installing torch")
+
+    message = str(excinfo.value)
+    assert "installing torch" in message
+    assert "could not resolve torch==9.9.9" in message
+
+
+def test_chatty_output_is_throttled():
+    """uv redraws progress bars far faster than anyone can read."""
+    said = []
+    script = "\n".join(f"print('line {i}', flush=True)" for i in range(200))
+    bootstrap._run([sys.executable, "-c", script], said.append, "noisy", quiet_for=5.0)
+
+    # The heading, and the final line as a summary -- not two hundred updates.
+    assert len(said) <= 3, said
+    assert "line 199" in said[-1]

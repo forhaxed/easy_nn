@@ -188,15 +188,42 @@ def _site_packages(python: str) -> str:
     return result.stdout.strip()
 
 
-def _run(command, say, what):
+def _run(command, say, what, quiet_for=2.0):
+    """Run a build step, forwarding its output home as it happens.
+
+    Downloading torch takes minutes. Collecting the output and reporting it at
+    the end would leave the client staring at a dead terminal, unable to tell a
+    slow download from a hung pod -- so lines go out while the command runs,
+    throttled because uv redraws progress bars far faster than anyone can read.
+    """
+    import time
+
     say(f"  {what}...\n")
-    result = subprocess.run(
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
-    if result.returncode != 0:
+
+    tail = []
+    last_spoke = 0.0
+    for line in process.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        tail.append(line)
+        del tail[:-40]  # enough context if this ends up in an error
+        now = time.monotonic()
+        if now - last_spoke >= quiet_for:
+            say(f"  {line}\n")
+            last_spoke = now
+
+    process.wait()
+    if process.returncode != 0:
         raise RuntimeError(
-            f"failed while {what} (exit {result.returncode}):\n{result.stdout}"
+            f"failed while {what} (exit {process.returncode}):\n" + "\n".join(tail)
         )
-    tail = [line for line in (result.stdout or "").splitlines() if line.strip()][-1:]
     if tail:
-        say(f"  {tail[0]}\n")
+        say(f"  {tail[-1]}\n")
