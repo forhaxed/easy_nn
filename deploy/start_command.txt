@@ -3,25 +3,33 @@ Paste this into the RunPod template's "Container Start Command" field.
 Replace YOUR_GITHUB and YOUR_SECRET.  Nothing else about the pod needs setting
 up: the job carries its own code, its own weights and its own package list.
 
-  bash -lc "pip install --no-cache-dir git+https://github.com/YOUR_GITHUB/easy_nn && EASY_NN_TOKEN=YOUR_SECRET easy-nn-server --port 7654"
+  bash -lc "pip install --no-cache-dir git+https://github.com/YOUR_GITHUB/easy_nn && EASY_NN_TOKEN=YOUR_SECRET easy-nn-server --port 70000"
 
 Template settings that matter:
 
   Container Image     runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
                       (any recent runpod/pytorch works; easy_nn does not care)
-  Expose TCP Ports    7654
+  Expose TCP Ports    70000
   Public IP           required -- pick a machine that offers one
 
-RunPod maps 7654 to an external port and tells the container about it through
-RUNPOD_PUBLIC_IP and RUNPOD_TCP_PORT_7654.  The server prints the resulting
-address on startup, e.g.
+Pick a port above 70000.  RunPod normally maps your container port to some
+unrelated external one (7654 might come out as 41234), but for ports above
+70000 it allocates a matching pair, so the number you dial is the number you
+configured.  Either way the container is told the truth through
+RUNPOD_PUBLIC_IP and RUNPOD_TCP_PORT_<port>, and the server prints the
+resulting address on startup:
 
-  easy_nn executor listening on port 7654
-    connect with: RunPod(host='194.26.196.4', port=41234)
+  easy_nn executor listening on port 70000
+    connect with: RunPod(host='194.26.196.4', port=70000)
+
+To read it yourself, open the pod's Connect menu and look under "Direct TCP
+Ports", or run this in the pod's terminal:
+
+  echo $RUNPOD_PUBLIC_IP $RUNPOD_TCP_PORT_70000
 
 Use exactly that in your script:
 
-  t.train(on=RunPod(host="194.26.196.4", port=41234, token="YOUR_SECRET"))
+  t.train(on=RunPod(host="194.26.196.4", port=70000, token="YOUR_SECRET"))
 
 Notes
 

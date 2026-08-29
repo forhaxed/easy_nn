@@ -13,7 +13,7 @@ import argparse
 
 import torch
 
-from easy_nn import DataSource, Local, Trainer
+from easy_nn import DataSource, Local, RunPod, Trainer
 
 TRUE_W = torch.tensor([2.0, -3.0, 0.5, 1.5])
 
@@ -85,10 +85,21 @@ def build_trainer(output_dir="./output"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default="./output")
+    parser.add_argument("--on", choices=("local", "runpod"), default="local")
+    parser.add_argument("--host", help="RunPod public IP")
+    parser.add_argument("--port", type=int, help="the external mapped port")
+    parser.add_argument("--token", help="matches EASY_NN_TOKEN on the pod")
     args = parser.parse_args()
 
+    if args.on == "runpod":
+        if not args.host or not args.port:
+            parser.error("--on runpod needs --host and --port")
+        executor = RunPod(host=args.host, port=args.port, token=args.token)
+    else:
+        executor = Local()
+
     trainer = build_trainer(args.output)
-    result = trainer.train(on=Local())
+    result = trainer.train(on=executor)
 
     print(f"\nfinished at step {result['global_step']}")
     print(f"tensorboard --logdir {result['log_dir']}")

@@ -103,9 +103,15 @@ def run_job(trainer, executor):
 #  Setup
 # ======================================================================
 def _handshake(channel, executor, console):
+    import easy_nn
+
     channel.send(
         protocol.HELLO,
-        {"proto": protocol.PROTO_VERSION, "token": getattr(executor, "token", None)},
+        {
+            "proto": protocol.PROTO_VERSION,
+            "token": getattr(executor, "token", None),
+            "easy_nn": easy_nn.__version__,
+        },
     )
     reply = channel.recv()
     if reply.type == protocol.ERROR:
@@ -117,8 +123,19 @@ def _handshake(channel, executor, console):
         f"{Fore.BLUE}Executor:{Style.RESET_ALL} {executor.describe()} "
         f"| python {reply.meta.get('python')} "
         f"| torch {reply.meta.get('torch')} "
+        f"| easy_nn {reply.meta.get('easy_nn', '?')} "
         f"| {reply.meta.get('device')}\n"
     )
+
+    # The executor runs its own copy of easy_nn, updated on its own schedule.
+    # A mismatch is not fatal, but it explains a whole class of odd failures.
+    theirs = reply.meta.get("easy_nn")
+    if theirs is not None and theirs != easy_nn.__version__:
+        console.text(
+            f"{Fore.YELLOW}Warning: executor runs easy_nn {theirs}, you have "
+            f"{easy_nn.__version__}. Restart the pod to pick up your changes."
+            f"{Style.RESET_ALL}\n"
+        )
 
 
 def _send_job(trainer, executor, channel, console):

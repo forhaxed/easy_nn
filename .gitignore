@@ -50,3 +50,9 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+### easy_nn
+# Training output: logs, checkpoints and lock files
+output/
+output_*/
+
+README.md

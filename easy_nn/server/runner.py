@@ -163,9 +163,12 @@ def _environment():
 
     import torch
 
+    import easy_nn
+
     return {
         "python": platform.python_version(),
         "torch": torch.__version__,
+        "easy_nn": easy_nn.__version__,
         "cuda": torch.cuda.is_available(),
         "device": torch.cuda.get_device_name(0)
         if torch.cuda.is_available()
