@@ -1,0 +1,38 @@
+Paste this into the RunPod template's "Container Start Command" field.
+
+Replace YOUR_GITHUB and YOUR_SECRET.  Nothing else about the pod needs setting
+up: the job carries its own code, its own weights and its own package list.
+
+  bash -lc "pip install --no-cache-dir git+https://github.com/YOUR_GITHUB/easy_nn && EASY_NN_TOKEN=YOUR_SECRET easy-nn-server --port 7654"
+
+Template settings that matter:
+
+  Container Image     runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+                      (any recent runpod/pytorch works; easy_nn does not care)
+  Expose TCP Ports    7654
+  Public IP           required -- pick a machine that offers one
+
+RunPod maps 7654 to an external port and tells the container about it through
+RUNPOD_PUBLIC_IP and RUNPOD_TCP_PORT_7654.  The server prints the resulting
+address on startup, e.g.
+
+  easy_nn executor listening on port 7654
+    connect with: RunPod(host='194.26.196.4', port=41234)
+
+Use exactly that in your script:
+
+  t.train(on=RunPod(host="194.26.196.4", port=41234, token="YOUR_SECRET"))
+
+Notes
+
+* The token is the only thing standing between your pod and anyone who finds
+  the port, and the job protocol runs arbitrary code by design.  Use a long
+  random one and do not reuse it.
+* Traffic is not encrypted.  Do not stream data you would mind a network
+  operator reading.
+* The server takes one job at a time and stays up between jobs, so a second
+  run reuses the warm pod.  Restart the pod to pick up a new easy_nn version.
+* RunPod's GitHub auto-build is a Serverless feature; pods take a prebuilt
+  image from a registry.  If you would rather not pip-install on every pod
+  start, build an image in GitHub Actions, push it to GHCR and point the
+  template at it -- nothing in easy_nn changes.
