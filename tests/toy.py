@@ -48,6 +48,47 @@ class ToyTrainer(Trainer):
         return loss, {}
 
 
+class RecordingData(ToyData):
+    """Remembers how pack() was called, so tests can see the refill pattern."""
+
+    def setup(self):
+        super().setup()
+        self.group_sizes = []
+
+    def pack(self, batches):
+        self.group_sizes.append(len(batches))
+        return super().pack(batches)
+
+
+class ArtifactTrainer(ToyTrainer):
+    """Sends something home mid-run for the local side to finish."""
+
+    def train_step(self, step, batch, device, weight_dtype):
+        loss, extra = super().train_step(step, batch, device, weight_dtype)
+        if self.global_step == 3:
+            self.send_artifact(
+                "probe",
+                {"prediction": self.models[0](batch["x"]).detach().cpu(),
+                 "note": "computed on the executor"},
+            )
+        return loss, extra
+
+    def on_artifact(self, name, payload, step, reporter):
+        # Runs LOCALLY. Record it and write an image the executor never saw.
+        self.received = getattr(self, "received", [])
+        self.received.append((name, step, payload["note"], tuple(payload["prediction"].shape)))
+        reporter.log({"artifact/rows": float(payload["prediction"].shape[0])}, step)
+        reporter.log_image(
+            "artifact/grid", numpy_grid(payload["prediction"].shape[0]), step
+        )
+
+
+def numpy_grid(rows):
+    import numpy as np
+
+    return np.full((max(rows, 1), 4, 3), 128, dtype=np.uint8)
+
+
 class ExplodingTrainer(ToyTrainer):
     def train_step(self, step, batch, device, weight_dtype):
         raise ValueError("deliberate failure inside train_step")
@@ -85,8 +126,8 @@ def build(tmp_path, trainer_class=ToyTrainer, **overrides):
     trainer.batch_size = 8
     trainer.epochs = 1
     trainer.gradient_accumulation_steps = 1
-    trainer.precache_size = 4
-    trainer.blob_buffer = 2
+    trainer.blob_size = 8
+    trainer.blob_size_prepare = 4
     trainer.mixed_precision = "no"
     for key, value in overrides.items():
         setattr(trainer, key, value)

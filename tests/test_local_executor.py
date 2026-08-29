@@ -77,8 +77,8 @@ def test_remote_failure_arrives_with_its_traceback(tmp_path):
     assert "train_step" in text
 
 
-def test_runs_with_a_single_blob_of_buffer(tmp_path):
-    trainer = toy.build(tmp_path, blob_buffer=1, precache_size=2)
+def test_runs_with_the_shallowest_possible_queue(tmp_path):
+    trainer = toy.build(tmp_path, blob_size=1, blob_size_prepare=1)
     result = trainer.train(on=Local())
     assert result["global_step"] == 32
 

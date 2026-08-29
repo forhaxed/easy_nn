@@ -77,3 +77,28 @@ def test_oversized_frame_is_rejected():
     left.transport._writer.flush()
     with pytest.raises(protocol.ProtocolError, match="out of bounds"):
         right.recv()
+
+
+def test_byte_counters_track_both_directions():
+    left, right = make_pair()
+    assert left.transport.bytes_sent == 0
+    assert right.transport.bytes_received == 0
+
+    body = codec.encode({"weights": torch.zeros(5000)})
+    left.send(protocol.JOB, {"job": 1}, body)
+    right.recv()
+
+    sent = left.transport.bytes_sent
+    received = right.transport.bytes_received
+    assert sent == received, "every byte written was read"
+    # Header frames plus the tensor itself; 5000 floats is 20000 bytes.
+    assert sent > 20000
+
+
+def test_counters_include_framing_overhead():
+    left, right = make_pair()
+    left.send(protocol.DONE)
+    right.recv()
+    # A bodyless message is still a header frame plus a pickled meta payload.
+    assert left.transport.bytes_sent > protocol.HEADER_SIZE
+    assert right.transport.bytes_received == left.transport.bytes_sent

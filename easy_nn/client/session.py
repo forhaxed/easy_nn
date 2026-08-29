@@ -1,16 +1,18 @@
 """
 The local brain.
 
-It ships the job, feeds data as fast as the executor has room for, and writes
-down everything that comes back.  The executor decides *when* to train; this
-side decides *what* exists -- the data, the logs, the checkpoints.
+It ships the job, keeps the executor's queue topped up, and writes down
+everything that comes back.  The executor decides *when* to train; this side
+decides *what* exists -- the data, the logs, the checkpoints.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import threading
+import time
 import uuid
 
 from colorama import Fore, Style
@@ -18,6 +20,7 @@ from tqdm.auto import tqdm
 
 from easy_nn import codec, job, protocol
 from easy_nn.client.locks import LockWatcher
+from easy_nn.client.reporter import Reporter
 from easy_nn.client.sinks import CheckpointSink, ConsoleSink, TensorBoardSink
 
 
@@ -59,6 +62,7 @@ def run_job(trainer, executor):
     console = ConsoleSink()
     board = TensorBoardSink(trainer.output_dir)
     checkpoints = CheckpointSink(trainer.output_dir)
+    reporter = Reporter(board, console)
 
     channel = executor.connect()
     state = _State(trainer, channel)
@@ -78,15 +82,14 @@ def run_job(trainer, executor):
         watcher = LockWatcher(trainer.output_dir, state.send_control)
         watcher.start()
 
-        feeder = threading.Thread(
-            target=state.feed, name="easy-nn-feeder", daemon=True
-        )
+        feeder = threading.Thread(target=state.feed, name="easy-nn-feeder", daemon=True)
         feeder.start()
 
-        return _pump(state, console, board, checkpoints)
+        return _pump(state, console, board, checkpoints, reporter)
     finally:
         state.stop.set()
-        state.credits.release(1 << 20)  # unblock a feeder waiting on credit
+        with state.queue_changed:
+            state.queue_changed.notify_all()
         if watcher is not None:
             watcher.stop()
         if feeder is not None:
@@ -153,15 +156,11 @@ def _send_job(trainer, executor, channel, console):
         console.text(f"Shipping project modules: {', '.join(shipped)}\n")
 
     # Weights are float noise and do not compress; only an explicit "zstd"
-    # asks for it here.  "auto" probes on the first data blob instead, where
+    # asks for it here.  "auto" probes on the first work batch instead, where
     # the answer actually varies with what pack() produces.
     body = codec.encode(trainer, compress=trainer.compression == "zstd")
     bar = tqdm(
-        total=body.nbytes,
-        unit="B",
-        unit_scale=True,
-        desc="Uploading job",
-        leave=False,
+        total=body.nbytes, unit="B", unit_scale=True, desc="Uploading job", leave=False
     )
     header = len(body.header)
     bar.update(header)
@@ -187,8 +186,6 @@ def _apply_resume_position(trainer, payload):
     raw = payload.get("trainer_metadata.json")
     if not raw:
         return
-    import json
-
     meta = json.loads(bytes(raw))
     trainer.global_step = meta.get("global_step", 0)
     trainer.epochs_trained = meta.get("epochs_trained", 0)
@@ -217,10 +214,14 @@ class _State:
     def __init__(self, trainer, channel):
         self.trainer = trainer
         self.channel = channel
-        self.credits = threading.Semaphore(0)
         self.stop = threading.Event()
         self.compressor = _Compressor(trainer.compression)
         self.error = None
+
+        #: Units of work believed to be sitting on the executor.
+        self.outstanding = 0
+        self.queue_changed = threading.Condition()
+        self.pack_seconds = 0.0
 
     def send_control(self, action):
         if not self.stop.is_set():
@@ -228,6 +229,11 @@ class _State:
                 self.channel.send(protocol.CTRL, {"action": action})
             except (OSError, ValueError):
                 pass
+
+    def credit(self, n: int):
+        with self.queue_changed:
+            self.outstanding = max(0, self.outstanding - n)
+            self.queue_changed.notify_all()
 
     # -- the feeder thread ------------------------------------------------
     def feed(self):
@@ -244,62 +250,84 @@ class _State:
     def _feed_eval(self):
         source = self.trainer.eval_data
         if source is not None:
-            for blob in _grouped(source, self.trainer.precache_size):
+            for group in _grouped(source, self.trainer.blob_size_prepare):
                 if self.stop.is_set():
                     break
                 self.channel.send(
-                    protocol.BLOB, {"kind": "eval"}, self.compressor.encode(blob)
+                    protocol.BLOB,
+                    {"kind": "eval", "units": len(group)},
+                    self.compressor.encode(source.pack(group)),
                 )
         self.channel.send(protocol.STREAM_END, {"kind": "eval"})
 
     def _feed_train(self):
-        trainer = self.trainer
-        skip = 0
-        if trainer.steps_in_epoch > 0:
-            skip = (
-                trainer.steps_in_epoch * trainer.gradient_accumulation_steps
-            ) // max(1, trainer.repeats)
+        """Top the executor's queue back up whenever it drops below blob_size.
 
-        for epoch in range(trainer.epochs_trained, trainer.epochs):
-            for blob in _grouped(trainer.data, trainer.precache_size, skip=skip):
-                if not self._await_credit():
-                    return
-                self.channel.send(
-                    protocol.BLOB,
-                    {"kind": "train", "epoch": epoch},
-                    self.compressor.encode(blob),
-                )
-            skip = 0
-            self.channel.send(protocol.EPOCH_END, {"epoch": epoch})
-            if self.stop.is_set():
+        One unbroken stream: epoch boundaries never flush a partial batch, so a
+        one-sample dataset simply fills the queue with itself instead of
+        dribbling out a single unit per epoch.
+        """
+        trainer = self.trainer
+        prepare = max(1, trainer.blob_size_prepare)
+
+        for group in _grouped(_units(trainer), prepare):
+            if not self._await_room():
                 return
+            payload = self.compressor.encode(trainer.data.pack(group))
+            self.channel.send(
+                protocol.BLOB, {"kind": "train", "units": len(group)}, payload
+            )
+            with self.queue_changed:
+                self.outstanding += len(group)
+
         self.channel.send(protocol.STREAM_END, {"kind": "train"})
 
-    def _await_credit(self) -> bool:
-        while not self.stop.is_set():
-            if self.credits.acquire(timeout=0.25):
-                return not self.stop.is_set()
-        return False
+    def _await_room(self) -> bool:
+        with self.queue_changed:
+            while not self.stop.is_set() and self.outstanding >= self.trainer.blob_size:
+                self.queue_changed.wait(timeout=0.25)
+            return not self.stop.is_set()
 
 
-def _grouped(source, size, skip=0):
-    """Batches from a DataSource, packed ``size`` at a time."""
-    stream = source.stream()
-    if skip:
-        stream = itertools.islice(stream, skip, None)
-    buffer = []
-    for batch in stream:
-        buffer.append(batch)
-        if len(buffer) >= size:
-            yield source.pack(buffer)
-            buffer = []
-    if buffer:
-        yield source.pack(buffer)
+def _units(trainer):
+    """Every training sample the run needs, as one continuous stream."""
+    skip = 0
+    if trainer.steps_in_epoch > 0 and trainer.allow_skip_batches_on_resume:
+        skip = (
+            trainer.steps_in_epoch * trainer.gradient_accumulation_steps
+        ) // max(1, trainer.repeats)
+
+    for _ in range(trainer.epochs_trained, trainer.epochs):
+        stream = trainer.data.stream()
+        if skip:
+            stream = itertools.islice(stream, skip, None)
+            skip = 0
+        yield from stream
 
 
-def _pump(state, console, board, checkpoints):
+def _grouped(source_or_iter, size):
+    """Chunk an iterable into lists of at most ``size``."""
+    iterator = (
+        source_or_iter.stream()
+        if hasattr(source_or_iter, "stream")
+        else source_or_iter
+    )
+    group = []
+    for item in iterator:
+        group.append(item)
+        if len(group) >= size:
+            yield group
+            group = []
+    if group:
+        yield group
+
+
+def _pump(state, console, board, checkpoints, reporter):
     """Read events from the executor until the run ends."""
     saved = []
+    transport = getattr(state.channel, "transport", None)
+    net = _NetworkMeter(transport)
+
     while True:
         try:
             message = state.channel.recv()
@@ -312,13 +340,25 @@ def _pump(state, console, board, checkpoints):
 
         kind = message.type
         if kind == protocol.CREDIT:
-            state.credits.release(int(message.meta.get("n", 1)))
+            state.credit(int(message.meta.get("n", 1)))
         elif kind == protocol.LOG:
-            board.log(message.meta["values"], message.meta["step"])
+            step = message.meta["step"]
+            board.log(message.meta["values"], step)
+            extra = net.sample()
+            extra["queue/outstanding"] = float(state.outstanding)
+            board.log(extra, step)
+            console.set_extra(
+                up=f"{extra['net/up_MBps']:.1f}MB/s",
+                q=int(state.outstanding),
+            )
         elif kind == protocol.PRINT:
             console.text(message.meta["text"])
         elif kind == protocol.PROGRESS:
             console.progress(**message.meta)
+        elif kind == protocol.ARTIFACT:
+            state.trainer.on_artifact(
+                message.meta["name"], message.body, message.meta["step"], reporter
+            )
         elif kind == protocol.CHECKPOINT:
             path = checkpoints.save(message.meta["name"], message.body)
             saved.append(path)
@@ -331,6 +371,32 @@ def _pump(state, console, board, checkpoints):
             }
         elif kind == protocol.ERROR:
             raise RemoteError(_error_text(message))
+
+
+class _NetworkMeter:
+    """Turns the transport's byte counters into rates."""
+
+    def __init__(self, transport):
+        self.transport = transport
+        self._last = time.perf_counter()
+        self._sent = self._read("bytes_sent")
+        self._received = self._read("bytes_received")
+
+    def _read(self, attribute):
+        return float(getattr(self.transport, attribute, 0) or 0)
+
+    def sample(self) -> dict:
+        now = time.perf_counter()
+        sent, received = self._read("bytes_sent"), self._read("bytes_received")
+        span = max(now - self._last, 1e-6)
+        rates = {
+            "net/up_MBps": (sent - self._sent) / span / 1e6,
+            "net/down_MBps": (received - self._received) / span / 1e6,
+            "net/up_total_GB": sent / (1 << 30),
+            "net/down_total_GB": received / (1 << 30),
+        }
+        self._last, self._sent, self._received = now, sent, received
+        return rates
 
 
 def _error_text(message):

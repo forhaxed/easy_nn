@@ -12,7 +12,7 @@ import threading
 import traceback
 
 from easy_nn import protocol
-from easy_nn.server.blobq import BlobFeed
+from easy_nn.server.blobq import WorkQueue
 from easy_nn.server.link import Link
 
 
@@ -90,7 +90,7 @@ class Runner:
         trainer = job.body
 
         self.link = Link(self.channel)
-        self.feed = BlobFeed(
+        self.feed = WorkQueue(
             on_consume=lambda n: self.channel.send(protocol.CREDIT, {"n": n}),
             eval_memory_limit=job.meta.get("eval_memory_limit", 2 << 30),
         )
@@ -111,8 +111,6 @@ class Runner:
         )
         self._reader.start()
 
-        # Prime the client with the buffer's worth of credit.
-        self.channel.send(protocol.CREDIT, {"n": trainer.blob_buffer})
 
         trainer.init()
         if resume is not None:
@@ -140,9 +138,7 @@ class Runner:
             if message.meta.get("kind") == "eval":
                 self.feed.put_eval(message.body, _nbytes(message))
             else:
-                self.feed.put_blob(message.body)
-        elif message.type == protocol.EPOCH_END:
-            self.feed.put_epoch_end(message.meta.get("epoch"))
+                self.feed.put(message.body, int(message.meta.get("units", 1)))
         elif message.type == protocol.STREAM_END:
             if message.meta.get("kind") == "eval":
                 self.feed.eval_done()

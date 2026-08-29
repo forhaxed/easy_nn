@@ -21,6 +21,7 @@ class ConsoleSink:
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.bar = None
+        self.extra = {}
 
     def text(self, text: str):
         if not self.enabled:
@@ -42,7 +43,13 @@ class ConsoleSink:
         if step is not None:
             self.bar.update(max(0, step - self.bar.n))
         if postfix:
-            self.bar.set_postfix(**postfix)
+            merged = dict(self.extra)
+            merged.update(postfix)
+            self.bar.set_postfix(**merged)
+
+    def set_extra(self, **fields):
+        """Fields the client owns -- bandwidth, ETA -- shown alongside the rest."""
+        self.extra.update(fields)
 
     def close(self):
         if self.bar is not None:
@@ -70,6 +77,15 @@ class TensorBoardSink:
     def log(self, values: dict, step: int):
         for key, value in values.items():
             self.writer.add_scalar(key, value, step)
+        self.writer.flush()
+
+    def log_image(self, tag: str, image, step: int):
+        """Write an image. HWC uint8 arrays are the common case."""
+        import numpy as np
+
+        array = np.asarray(image)
+        fmt = "HWC" if array.ndim == 3 and array.shape[-1] in (1, 3, 4) else "CHW"
+        self.writer.add_image(tag, array, step, dataformats=fmt)
         self.writer.flush()
 
     def close(self):

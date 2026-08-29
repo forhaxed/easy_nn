@@ -5,12 +5,10 @@ A ``Trainer`` subclass travels to the executor whole -- cloudpickle sends the
 class by value, so the pod runs code it has never seen and needs no copy of
 your project.  Everything you assign to it travels too.
 
-Two halves, one object:
-
-* locally you configure it and call ``train(on=...)``;
-* on the executor it runs ``training_loop()``, reading batches out of a queue
-  of blobs instead of a dataloader, and reporting everything back over the
-  link.  It never touches the executor's disk.
+Two halves, one object.  Methods under "Local side" run on your machine on the
+original instance; everything else runs on the executor, reading units of work
+out of a queue instead of a dataloader and reporting back over the link.  It
+never writes logs or checkpoints to the executor's disk.
 """
 
 from __future__ import annotations
@@ -46,6 +44,9 @@ class _NullLink:
         pass
 
     def checkpoint(self, name, payload):
+        raise RuntimeError("no executor attached")
+
+    def artifact(self, name, payload, step, compress=False):
         raise RuntimeError("no executor attached")
 
     def take_control(self):
@@ -89,8 +90,14 @@ class Trainer:
         self.eval_data = None
 
         self.repeats = 1
-        self.precache_size = 1
-        self.blob_buffer = 2
+
+        #: How many units of work should be sitting on the executor. A unit is
+        #: one sample: the queue depth, not the size of a message.
+        self.blob_size = 16
+        #: How many units the local side prepares and ships in one go, once the
+        #: executor's queue has dropped below ``blob_size``.
+        self.blob_size_prepare = 8
+
         #: The executor holds the whole eval set in memory; this caps it.
         self.eval_memory_limit = 2 << 30
         self.compression = "auto"  # "auto" | "zstd" | "off"
@@ -105,6 +112,7 @@ class Trainer:
         self.mixed_precision = "no"
         self.seed = None
         self.resume_from = None
+        self.allow_skip_batches_on_resume = True
         #: Extra directories whose modules should travel by value.
         self.ship_modules = []
 
@@ -121,9 +129,10 @@ class Trainer:
         self._eval_requested = False
         self._stop_requested = False
         self._stream_done = False
+        self._unpack_seconds = 0.0
 
     # ================================================================
-    #  Local side
+    #  Local side -- runs on your machine
     # ================================================================
     def __getstate__(self):
         """Drop the local-only halves so the trainer can cross the wire."""
@@ -139,7 +148,7 @@ class Trainer:
         """Run this job on ``on`` -- an executor such as ``Local()``.
 
         This is the local entry point.  It packs the trainer up, ships it, and
-        then feeds data and collects logs and checkpoints until the run ends.
+        then feeds work and collects logs and checkpoints until the run ends.
         To customize the loop itself, override ``training_loop``.
         """
         if on is None:
@@ -152,12 +161,26 @@ class Trainer:
 
         return run_job(self, on)
 
+    def on_artifact(self, name, payload, step, reporter):
+        """Handle something the executor sent home. **Runs locally.**
+
+        This is the counterpart of ``send_artifact``: work the executor should
+        not finish itself lands here, on your machine, with your models and
+        your data at hand.  Validation latents, for instance, get decoded here
+        by the local VAE and written to TensorBoard through ``reporter``.
+        """
+
     # ================================================================
     #  Executor side -- services available to your code
     # ================================================================
     @property
     def device(self):
         return self.accelerator.device
+
+    @property
+    def steps_per_epoch(self) -> int:
+        effective = self.batch_size * self.gradient_accumulation_steps
+        return max(1, (self.dataset_size // effective) * self.repeats)
 
     def log(self, values: dict, step: int | None = None):
         """Send scalars to the local TensorBoard writer."""
@@ -169,15 +192,20 @@ class Trainer:
         sep = kwargs.pop("sep", " ")
         self._link.print(sep.join(str(a) for a in args) + end)
 
+    def send_artifact(self, name: str, payload, step: int | None = None):
+        """Ship a tensor-bearing payload home for ``on_artifact`` to handle."""
+        self._link.artifact(
+            name, payload, self.global_step if step is None else step
+        )
+
     # ================================================================
     #  Executor side -- hooks to override
     # ================================================================
     def unpack(self, blob, device, weight_dtype):
-        """Turn one blob back into a list of batches.
+        """Turn one prepared batch back into a list of training batches.
 
         Runs on the executor with the GPU available, so this is the place to
-        do anything expensive that you would rather not send over the wire --
-        encoding latents, for instance.
+        do anything expensive that you would rather not send over the wire.
         """
         return blob
 
@@ -232,7 +260,7 @@ class Trainer:
 
         self.print(f"{Fore.GREEN}easy_nn training started...{Style.RESET_ALL}\n")
         self.print(f"{Fore.BLUE}Models Summary:{Style.RESET_ALL}")
-        for i, model in enumerate(self.models):
+        for model in self.models:
             total = sum(p.numel() for p in model.parameters())
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             self.print(
@@ -259,33 +287,38 @@ class Trainer:
         self.scheduler = self.accelerator.prepare(self.scheduler)
 
     # ================================================================
-    #  Executor side -- batches
+    #  Executor side -- work
     # ================================================================
-    def _explode(self, blob):
-        """One blob -> the batches it holds, honouring ``repeats``."""
-        batches = self.unpack(blob, self.accelerator.device, self.weight_dtype)
-        for batch in batches:
-            if isinstance(batch, dict):
-                batch.setdefault("batch_hash", random.randint(0, 2**63))
-            for _ in range(self.repeats):
-                yield batch
-
-    def epoch_batches(self):
-        """Yield the batches of one epoch, stopping at the epoch boundary."""
-        for kind, payload in self._feed.train_stream():
-            if kind == "epoch_end":
-                return
-            if kind == "end":
-                self._stream_done = True
-                return
-            with torch.no_grad():
-                exploded = list(self._explode(payload))
-            yield from exploded
-
     def batches(self):
-        """Yield every remaining batch, across epochs.  For custom loops."""
-        while not self._stream_done:
-            yield from self.epoch_batches()
+        """Yield training batches from the queue, continuously.
+
+        Epoch boundaries do not appear here: the client sends one unbroken
+        stream and the executor derives epoch bookkeeping from the step count.
+        Credit for a unit goes back only once its batches have been consumed,
+        so the client's picture of the queue reflects real progress.
+        """
+        for payload, units in self._feed.stream():
+            started = time.perf_counter()
+            with torch.no_grad():
+                unpacked = self.unpack(
+                    payload, self.accelerator.device, self.weight_dtype
+                )
+            self._unpack_seconds += time.perf_counter() - started
+
+            credited = 0
+            for batch in unpacked:
+                if isinstance(batch, dict):
+                    batch.setdefault("batch_hash", random.randint(0, 2**63))
+                for _ in range(self.repeats):
+                    yield batch
+                if credited < units:
+                    self._feed.consumed(1)
+                    credited += 1
+
+            # Keep credit exact even if unpack changed the count.
+            if credited < units:
+                self._feed.consumed(units - credited)
+        self._stream_done = True
 
     # ================================================================
     #  Executor side -- the loop
@@ -296,9 +329,7 @@ class Trainer:
             raise ValueError("trainer is missing batch_size, epochs or optimizer")
 
         effective_batch_size = self.batch_size * self.gradient_accumulation_steps
-        total_steps = (
-            (self.dataset_size // effective_batch_size) * self.epochs * self.repeats
-        )
+        total_steps = self.steps_per_epoch * self.epochs
 
         self.print(f"\n{Fore.BLUE}Training Configuration:{Style.RESET_ALL}")
         self.print(f" Device: {self.accelerator.device}")
@@ -309,7 +340,8 @@ class Trainer:
         self.print(f" Gradient Accumulation Steps: {self.gradient_accumulation_steps}")
         self.print(f" Effective Batch Size: {effective_batch_size}")
         self.print(f" Repeats: {self.repeats}")
-        self.print(f" Precache Size: {self.precache_size}")
+        self.print(f" Queue depth on executor: {self.blob_size}")
+        self.print(f" Prepared per refill: {self.blob_size_prepare}")
         self.print(f" Total Training Steps: {total_steps}\n")
 
         for model in self.non_trainable_models:
@@ -318,120 +350,140 @@ class Trainer:
 
         self._link.progress(total=total_steps, step=self.global_step, start=True)
 
-        for epoch in range(self.epochs_trained, self.epochs):
-            train_loss_accs = {}
-            starting_step = self.steps_in_epoch * self.gradient_accumulation_steps
+        train_loss_accs = {}
+        previous_wait = self._feed.wait_seconds if self._feed else 0.0
+        previous_unpack = self._unpack_seconds
+        step_started = time.perf_counter()
 
-            for step, batch in enumerate(self.epoch_batches(), start=starting_step):
-                with self.accelerator.accumulate(self.models):
-                    loss, loss_dict = self.train_step(
-                        self.global_step,
-                        batch,
-                        device=self.accelerator.device,
-                        weight_dtype=self.weight_dtype,
+        for batch in self.batches():
+            with self.accelerator.accumulate(self.models):
+                loss, loss_dict = self.train_step(
+                    self.global_step,
+                    batch,
+                    device=self.accelerator.device,
+                    weight_dtype=self.weight_dtype,
+                )
+                merged = dict(loss_dict or {})
+                merged["loss"] = loss
+
+                for key, value in merged.items():
+                    if torch.is_tensor(value):
+                        value = self.accelerator.gather(
+                            value.detach().repeat(self.batch_size)
+                        ).mean().item()
+                    train_loss_accs[key] = (
+                        train_loss_accs.get(key, 0.0)
+                        + float(value) / self.gradient_accumulation_steps
                     )
-                    merged = dict(loss_dict or {})
-                    merged["loss"] = loss
 
-                    for key, value in merged.items():
-                        if torch.is_tensor(value):
-                            value = self.accelerator.gather(
-                                value.detach().repeat(self.batch_size)
-                            ).mean().item()
-                        train_loss_accs[key] = (
-                            train_loss_accs.get(key, 0.0)
-                            + float(value) / self.gradient_accumulation_steps
+                self.accelerator.backward(loss)
+
+                grad_norm = None
+                if self.accelerator.sync_gradients:
+                    params = [
+                        p
+                        for group in self.optimizer.param_groups
+                        for p in group["params"]
+                        if p.grad is not None
+                    ]
+                    if params:
+                        grad_norm = self.accelerator.clip_grad_norm_(
+                            params,
+                            float("inf")
+                            if self.max_grad_norm is None
+                            else self.max_grad_norm,
                         )
 
-                    self.accelerator.backward(loss)
+                self.optimizer.step()
+                if self.accelerator.sync_gradients and self.scheduler is not None:
+                    self.scheduler.step()
+                self.optimizer.zero_grad()
 
-                    grad_norm = None
-                    if self.accelerator.sync_gradients:
-                        params = [
-                            p
-                            for group in self.optimizer.param_groups
-                            for p in group["params"]
-                            if p.grad is not None
-                        ]
-                        if params:
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                params,
-                                float("inf")
-                                if self.max_grad_norm is None
-                                else self.max_grad_norm,
-                            )
+            if not self.accelerator.sync_gradients:
+                continue
 
-                    self.optimizer.step()
-                    if self.accelerator.sync_gradients and self.scheduler is not None:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad()
+            self.gradient_sync(self.global_step)
 
-                if not self.accelerator.sync_gradients:
-                    continue
+            now = time.perf_counter()
+            wait_now = self._feed.wait_seconds if self._feed else 0.0
+            log_dict = {
+                "train/lr": self.scheduler.get_last_lr()[0],
+                "time/step_s": now - step_started,
+                "time/data_wait_s": wait_now - previous_wait,
+                "time/unpack_s": self._unpack_seconds - previous_unpack,
+                "queue/depth": float(self._feed.depth) if self._feed else 0.0,
+            }
+            step_started, previous_wait = now, wait_now
+            previous_unpack = self._unpack_seconds
 
-                self.gradient_sync(self.global_step)
+            from easy_nn.server.link import gpu_stats
 
-                log_dict = {"train/lr": self.scheduler.get_last_lr()[0]}
-                if grad_norm is not None:
-                    log_dict["train/grad_norm"] = float(grad_norm)
+            log_dict.update(gpu_stats())
 
-                for model in self.models:
-                    unwrapped = self.accelerator.unwrap_model(model)
-                    magnitude, count = 0.0, 0
-                    for param in unwrapped.parameters():
-                        if param.requires_grad:
-                            magnitude += param.data.abs().sum().item()
-                            count += param.numel()
-                    if count:
-                        name = unwrapped.__class__.__name__
-                        log_dict[f"train/avg_magnitude/{name}"] = magnitude / count
+            if grad_norm is not None:
+                log_dict["train/grad_norm"] = float(grad_norm)
 
-                for key, value in train_loss_accs.items():
-                    log_dict[f"train/{key}"] = value
+            for model in self.models:
+                unwrapped = self.accelerator.unwrap_model(model)
+                magnitude, count = 0.0, 0
+                for param in unwrapped.parameters():
+                    if param.requires_grad:
+                        magnitude += param.data.abs().sum().item()
+                        count += param.numel()
+                if count:
+                    name = unwrapped.__class__.__name__
+                    log_dict[f"train/avg_magnitude/{name}"] = magnitude / count
 
-                self.log(log_dict, self.global_step)
-                self._link.progress(
-                    # global_step is still the index of the step just finished.
-                    step=self.global_step + 1,
-                    total=total_steps,
-                    postfix={"step_loss": float(loss.detach())},
-                )
-                train_loss_accs = {}
+            for key, value in train_loss_accs.items():
+                log_dict[f"train/{key}"] = value
 
-                self.steps_in_epoch += 1
-                self.global_step += 1
+            self.log(log_dict, self.global_step)
+            self._link.progress(
+                # global_step is still the index of the step just finished.
+                step=self.global_step + 1,
+                total=total_steps,
+                postfix={
+                    "loss": round(float(loss.detach()), 4),
+                    "gpu": f"{log_dict.get('gpu/allocated_GB', 0.0):.1f}G",
+                    "wait": f"{log_dict['time/data_wait_s']:.2f}s",
+                },
+            )
+            train_loss_accs = {}
 
-                self._pump_controls()
+            self.global_step += 1
+            self.epochs_trained = self.global_step // self.steps_per_epoch
+            self.steps_in_epoch = self.global_step % self.steps_per_epoch
 
-                if self._save_requested or (
-                    self.save_checkpoint_every_steps > 0
-                    and self.global_step % self.save_checkpoint_every_steps == 0
-                ):
-                    self._save_requested = False
-                    self._emit_checkpoint(f"step_{self.global_step}")
+            self._pump_controls()
 
-                if self._eval_requested or (
-                    self.eval_every_steps > 0
-                    and self.global_step % self.eval_every_steps == 0
-                ):
-                    self._eval_requested = False
-                    self._run_eval()
+            if self._save_requested or (
+                self.save_checkpoint_every_steps > 0
+                and self.global_step % self.save_checkpoint_every_steps == 0
+            ):
+                self._save_requested = False
+                self._emit_checkpoint(f"step_{self.global_step}")
 
-                if self._paused:
-                    self._wait_while_paused()
+            if self._eval_requested or (
+                self.eval_every_steps > 0
+                and self.global_step % self.eval_every_steps == 0
+            ):
+                self._eval_requested = False
+                self._run_eval()
 
-                if self._stop_requested:
-                    self.print(
-                        f"{Fore.YELLOW}Stopping at step {self.global_step} "
-                        f"on request.{Style.RESET_ALL}"
-                    )
-                    break
+            if self._paused:
+                self._wait_while_paused()
 
             if self._stop_requested:
+                self.print(
+                    f"{Fore.YELLOW}Stopping at step {self.global_step} "
+                    f"on request.{Style.RESET_ALL}"
+                )
                 break
 
-            self.steps_in_epoch = 0
-            self.epochs_trained += 1
+            if self.global_step >= total_steps:
+                break
+
+            step_started = time.perf_counter()
 
         self._emit_checkpoint(f"step_{self.global_step}_final")
         self.print(f"{Fore.GREEN}Training complete!{Style.RESET_ALL}\n")
@@ -506,7 +558,7 @@ class Trainer:
             for model in self.models:
                 model.train()
 
-        if count:
+        if count and accs:
             log_dict = {f"eval/{k}": v / count for k, v in accs.items()}
             self.log(log_dict, self.global_step)
             self.print(f"Evaluation at step {self.global_step}: {log_dict}\n")

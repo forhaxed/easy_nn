@@ -35,8 +35,18 @@ class Link:
         self.channel.send(protocol.PROGRESS, kw)
 
     def checkpoint(self, name: str, payload: dict):
+        self.channel.send(protocol.CHECKPOINT, {"name": name}, codec.encode(payload))
+
+    def artifact(self, name: str, payload, step: int, compress: bool = False):
+        """Send anything tensor-bearing home for local post-processing.
+
+        Used for work the executor should not finish itself -- validation
+        latents, for instance, which the local side decodes with its own VAE.
+        """
         self.channel.send(
-            protocol.CHECKPOINT, {"name": name}, codec.encode(payload)
+            protocol.ARTIFACT,
+            {"name": name, "step": int(step)},
+            codec.encode(payload, compress=compress),
         )
 
     def take_control(self):
@@ -49,6 +59,21 @@ class Link:
     def push_control(self, command: str):
         with self._lock:
             self._controls.append(command)
+
+
+def gpu_stats() -> dict:
+    """VRAM figures for the log. Empty when there is no CUDA device."""
+    if not torch.cuda.is_available():
+        return {}
+    free, total = torch.cuda.mem_get_info()
+    giga = float(1 << 30)
+    return {
+        "gpu/allocated_GB": torch.cuda.memory_allocated() / giga,
+        "gpu/reserved_GB": torch.cuda.memory_reserved() / giga,
+        "gpu/peak_GB": torch.cuda.max_memory_allocated() / giga,
+        "gpu/free_GB": free / giga,
+        "gpu/total_GB": total / giga,
+    }
 
 
 def _scalar(value):

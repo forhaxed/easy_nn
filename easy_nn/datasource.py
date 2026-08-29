@@ -14,7 +14,8 @@ class DataSource:
 
     Override ``setup`` to build your dataloader, ``stream`` to yield batches
     and ``pack`` to decide what actually travels.  ``pack`` receives a list of
-    ``precache_size`` batches and its return value is serialized as one blob;
+    ``blob_size_prepare`` batches and its return value is serialized as one
+    message;
     the executor turns it back into batches with ``Trainer.unpack``.
     """
 
@@ -46,7 +47,7 @@ class DataSource:
         raise NotImplementedError(f"{type(self).__name__} must define stream()")
 
     def pack(self, batches):
-        """Turn ``precache_size`` batches into the blob that crosses the wire.
+        """Turn a group of batches into the payload that crosses the wire.
 
         The default sends the batches untouched.  Override to cut the payload
         down -- drop columns the training step never reads, cast to fp16, or
