@@ -61,6 +61,23 @@ class Runner:
             protocol.WELCOME, {"proto": protocol.PROTO_VERSION, **_environment()}
         )
 
+        # Dependencies first, before the client spends its uplink on weights:
+        # a job that cannot be unpickled here should fail in seconds, not after
+        # a multi-gigabyte upload.
+        try:
+            setup = self.channel.recv()
+        except (EOFError, OSError):
+            return False
+        if setup.type != protocol.SETUP:
+            self.channel.send(protocol.ERROR, {"message": "expected SETUP"})
+            return False
+        try:
+            self._install(setup.meta.get("requirements") or [])
+        except BaseException:
+            self.channel.send(protocol.ERROR, {"traceback": traceback.format_exc()})
+            return False
+        self.channel.send(protocol.READY, {})
+
         try:
             job = self.channel.recv()
         except (EOFError, OSError):
@@ -78,15 +95,18 @@ class Runner:
         return True
 
     # ------------------------------------------------------------------
+    def _install(self, requirements):
+        if not requirements:
+            return
+        from easy_nn.server.deps import ensure
+
+        ensure(
+            requirements,
+            report=lambda text: self.channel.send(protocol.PRINT, {"text": text}),
+        )
+
+    # ------------------------------------------------------------------
     def _run_job(self, job):
-        requirements = job.meta.get("requirements") or []
-        if requirements:
-            from easy_nn.server.deps import ensure
-
-            ensure(requirements, report=lambda t: self.channel.send(
-                protocol.PRINT, {"text": t}
-            ))
-
         trainer = job.body
 
         self.link = Link(self.channel)

@@ -102,3 +102,89 @@ def test_counters_include_framing_overhead():
     # A bodyless message is still a header frame plus a pickled meta payload.
     assert left.transport.bytes_sent > protocol.HEADER_SIZE
     assert right.transport.bytes_received == left.transport.bytes_sent
+
+
+def test_output_before_acceptance_is_printed_not_fatal():
+    """A cold pod installs requirements before it can accept the job, and says
+    so as it goes. Local() never installs anything, so only a real pod hits
+    this path -- it has to be covered here instead."""
+    from easy_nn.client.session import _await_accepted
+    from easy_nn.client.sinks import ConsoleSink
+
+    left, right = make_pair()
+    console = ConsoleSink(enabled=False)
+
+    left.send(protocol.PRINT, {"text": "Installing 5 packages: diffusers==0.37.1\n"})
+    left.send(protocol.PRINT, {"text": "Successfully installed diffusers\n"})
+    left.send(protocol.ACCEPTED, {"job_id": "abc"})
+
+    accepted = _await_accepted(right, console)
+    assert accepted.meta["job_id"] == "abc"
+
+
+def test_a_failure_during_setup_surfaces_instead_of_hanging():
+    from easy_nn.client.session import RemoteError, _await_accepted
+    from easy_nn.client.sinks import ConsoleSink
+
+    left, right = make_pair()
+    left.send(protocol.PRINT, {"text": "Installing 5 packages\n"})
+    left.send(protocol.ERROR, {"message": "pip install failed (1)"})
+
+    with pytest.raises(RemoteError, match="pip install failed"):
+        _await_accepted(right, ConsoleSink(enabled=False))
+
+
+def test_requirements_are_installed_before_the_weights_are_sent():
+    """A version mismatch is fatal on the executor. Discovering it after a
+    multi-gigabyte upload wastes the upload, so SETUP goes first."""
+    from easy_nn.client.session import _install_requirements
+    from easy_nn.client.sinks import ConsoleSink
+
+    class Executor:
+        installs_requirements = True
+
+    class Job:
+        requirements = ["diffusers==0.37.1", "peft==0.18.1"]
+
+    left, right = make_pair()
+
+    def server():
+        request = right.recv()
+        assert request.type == protocol.SETUP
+        assert request.meta["requirements"] == Job.requirements
+        right.send(protocol.PRINT, {"text": "Installing 2 packages\n"})
+        right.send(protocol.READY, {})
+
+    thread = threading.Thread(target=server)
+    thread.start()
+    _install_requirements(Job(), Executor(), left, ConsoleSink(enabled=False))
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_a_local_executor_still_completes_the_setup_step():
+    """Local installs nothing, but the exchange has to happen anyway so both
+    sides stay in lockstep."""
+    from easy_nn.client.session import _install_requirements
+    from easy_nn.client.sinks import ConsoleSink
+
+    class Executor:
+        installs_requirements = False
+
+    class Job:
+        requirements = ["diffusers==0.37.1"]
+
+    left, right = make_pair()
+    seen = []
+
+    def server():
+        request = right.recv()
+        seen.append(request.meta["requirements"])
+        right.send(protocol.READY, {})
+
+    thread = threading.Thread(target=server)
+    thread.start()
+    _install_requirements(Job(), Executor(), left, ConsoleSink(enabled=False))
+    thread.join(timeout=10)
+
+    assert seen == [[]], "nothing to install locally"

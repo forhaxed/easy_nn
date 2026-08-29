@@ -71,13 +71,10 @@ def run_job(trainer, executor):
 
     try:
         _handshake(channel, executor, console)
-        _send_job(trainer, executor, channel, console)
+        _install_requirements(trainer, executor, channel, console)
+        _send_job(trainer, channel, console)
 
-        message = channel.recv()
-        if message.type == protocol.ERROR:
-            raise RemoteError(_error_text(message))
-        if message.type != protocol.ACCEPTED:
-            raise protocol.ProtocolError(f"unexpected reply {message!r}")
+        _await_accepted(channel, console)
 
         watcher = LockWatcher(trainer.output_dir, state.send_control)
         watcher.start()
@@ -141,8 +138,41 @@ def _handshake(channel, executor, console):
         )
 
 
-def _send_job(trainer, executor, channel, console):
+def _await(channel, console, expected):
+    """Wait for one message type, printing whatever the executor says meanwhile.
+
+    Installing packages on a cold pod takes minutes and reports as it goes, so
+    output legitimately arrives ahead of the reply we are waiting for.
+    """
+    while True:
+        message = channel.recv()
+        if message.type == expected:
+            return message
+        if message.type == protocol.PRINT:
+            console.text(message.meta["text"])
+            continue
+        if message.type == protocol.ERROR:
+            raise RemoteError(_error_text(message))
+        raise protocol.ProtocolError(f"unexpected reply {message!r}")
+
+
+def _await_accepted(channel, console):
+    return _await(channel, console, protocol.ACCEPTED)
+
+
+def _install_requirements(trainer, executor, channel, console):
+    """Get the executor's environment right before sending anything large.
+
+    The trainer arrives there as a pickled object built by these libraries, so
+    a version mismatch is fatal -- and finding that out after a multi-gigabyte
+    upload wastes the upload. Ask first, send later.
+    """
     requirements = list(trainer.requirements) if executor.installs_requirements else []
+    channel.send(protocol.SETUP, {"requirements": requirements})
+    _await(channel, console, protocol.READY)
+
+
+def _send_job(trainer, channel, console):
     resume = _read_resume(trainer.resume_from)
     if resume is not None:
         # Both halves have to agree on where the run stands: the executor
@@ -168,7 +198,6 @@ def _send_job(trainer, executor, channel, console):
         protocol.JOB,
         {
             "job_id": uuid.uuid4().hex,
-            "requirements": requirements,
             "has_resume": resume is not None,
             "eval_memory_limit": getattr(trainer, "eval_memory_limit", 2 << 30),
         },
