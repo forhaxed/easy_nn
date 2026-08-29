@@ -72,7 +72,10 @@ class Runner:
             self.channel.send(protocol.ERROR, {"message": "expected SETUP"})
             return False
         try:
-            self._install(setup.meta.get("requirements") or [])
+            self._install(
+                setup.meta.get("requirements") or [],
+                setup.meta.get("verify_imports") or (),
+            )
         except BaseException:
             self.channel.send(protocol.ERROR, {"traceback": traceback.format_exc()})
             return False
@@ -95,15 +98,32 @@ class Runner:
         return True
 
     # ------------------------------------------------------------------
-    def _install(self, requirements):
-        if not requirements:
-            return
-        from easy_nn.server.deps import ensure
+    def _install(self, requirements, verify_imports=()):
+        say = lambda text: self.channel.send(protocol.PRINT, {"text": text})
 
-        ensure(
-            requirements,
-            report=lambda text: self.channel.send(protocol.PRINT, {"text": text}),
-        )
+        if requirements:
+            from easy_nn.server.deps import ensure
+
+            ensure(requirements, report=say)
+
+        # Installing is not the same as working. A torchvision built against a
+        # different torch imports fine as a package and then dies on its first
+        # operator; transformers pulls it in on import. Find that out here,
+        # while the client has sent nothing but a list of names.
+        import importlib
+
+        for name in verify_imports:
+            try:
+                importlib.import_module(name)
+            except BaseException as exc:
+                raise RuntimeError(
+                    f"the executor cannot import {name!r}: {type(exc).__name__}: {exc}\n"
+                    "Its environment is broken or mismatched -- fix the pod "
+                    "image or its start command before sending a job."
+                ) from exc
+
+        if verify_imports:
+            say(f"Verified imports: {', '.join(verify_imports)}\n")
 
     # ------------------------------------------------------------------
     def _run_job(self, job):

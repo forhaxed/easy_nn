@@ -116,6 +116,9 @@ class Trainer:
         #: Upload even when the executor's torch series differs. The job is a
         #: pickled object graph, so this usually fails at unpickle time.
         self.allow_torch_mismatch = False
+        #: Modules the executor must import before the job is sent. None means
+        #: derive them from ``requirements``; set a list to override.
+        self.verify_imports = None
         #: Extra directories whose modules should travel by value.
         self.ship_modules = []
 

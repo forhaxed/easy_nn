@@ -223,3 +223,50 @@ def test_the_mismatch_check_can_be_overridden():
     from easy_nn.client.session import _check_torch_match
 
     _check_torch_match("1.13.0", allow_mismatch=True)
+
+
+def test_setup_names_the_modules_the_executor_must_import():
+    """Version numbers are not enough: a torchvision built against a different
+    torch installs cleanly, imports as a package, then dies on its first
+    operator -- and transformers imports it for you."""
+    from easy_nn.client.session import _imports_to_verify
+
+    class T:
+        verify_imports = None
+
+    names = _imports_to_verify(T(), ["diffusers==0.37.1", "transformers==5.2.0"])
+    assert names[0] == "torch"
+    assert "diffusers" in names and "transformers" in names
+    assert "torchvision" in names, "this side has it, so the executor's must work"
+    assert len(names) == len(set(names)), "no duplicates"
+
+
+def test_verify_imports_can_be_set_explicitly():
+    from easy_nn.client.session import _imports_to_verify
+
+    class T:
+        verify_imports = ["torch", "cv2"]
+
+    assert _imports_to_verify(T(), ["opencv-python"]) == ["torch", "cv2"]
+
+
+def test_a_broken_executor_environment_is_caught_before_the_upload():
+    from easy_nn.server.runner import Runner
+
+    left, right = make_pair()
+    runner = Runner(right)
+
+    with pytest.raises(RuntimeError, match="cannot import 'definitely_not_a_module'"):
+        runner._install([], ["definitely_not_a_module"])
+
+
+def test_a_healthy_environment_reports_what_it_verified():
+    from easy_nn.server.runner import Runner
+
+    left, right = make_pair()
+    runner = Runner(right)
+    runner._install([], ["torch", "json"])
+
+    message = left.recv()
+    assert message.type == protocol.PRINT
+    assert "Verified imports: torch, json" in message.meta["text"]

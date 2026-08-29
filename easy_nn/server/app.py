@@ -70,9 +70,22 @@ def serve_tcp(host: str, port: int, token: str | None, once: bool = False):
 
 def _announce(port: int):
     """Print the address a client should dial, including RunPod's mapping."""
+    import platform
+
+    import torch
+
+    import easy_nn
+
     public_ip = os.environ.get("RUNPOD_PUBLIC_IP")
     mapped = os.environ.get(f"RUNPOD_TCP_PORT_{port}")
     print(f"easy_nn executor listening on port {port}", file=sys.stderr)
+    # Which image did this pod actually get? Jobs are refused outright when the
+    # torch series differs from the client's, so put it where the log shows it.
+    print(
+        f"  torch {torch.__version__} | python {platform.python_version()} "
+        f"| easy_nn {easy_nn.__version__}",
+        file=sys.stderr,
+    )
     if public_ip and mapped:
         print(
             f"  connect with: RunPod(host={public_ip!r}, port={mapped})",

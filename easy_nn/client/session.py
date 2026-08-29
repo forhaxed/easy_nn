@@ -8,9 +8,11 @@ decides *what* exists -- the data, the logs, the checkpoints.
 
 from __future__ import annotations
 
+import importlib.util
 import itertools
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -206,8 +208,40 @@ def _install_requirements(trainer, executor, channel, console):
     upload wastes the upload. Ask first, send later.
     """
     requirements = list(trainer.requirements) if executor.installs_requirements else []
-    channel.send(protocol.SETUP, {"requirements": requirements})
+    channel.send(
+        protocol.SETUP,
+        {
+            "requirements": requirements,
+            "verify_imports": _imports_to_verify(trainer, requirements),
+        },
+    )
     _await(channel, console, protocol.READY)
+
+
+def _imports_to_verify(trainer, requirements) -> list[str]:
+    """Modules the executor must actually import before we send it anything.
+
+    Version numbers are not enough: a torchvision built against a different
+    torch installs cleanly, imports as a package, and then dies registering an
+    operator -- and transformers imports it for you. Naming the modules and
+    letting the executor try is the only check that catches that.
+    """
+    explicit = getattr(trainer, "verify_imports", None)
+    if explicit is not None:
+        return list(explicit)
+
+    names = ["torch"]
+    for requirement in requirements:
+        name = re.split(r"[<>=!~\[;\s]", requirement.strip())[0]
+        if name:
+            names.append(name.replace("-", "_"))
+
+    # Only if this side has it: the executor's copy has to survive the same
+    # torch it was paired with here.
+    if importlib.util.find_spec("torchvision") is not None:
+        names.append("torchvision")
+
+    return list(dict.fromkeys(names))
 
 
 def _send_job(trainer, channel, console):
