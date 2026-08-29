@@ -113,6 +113,9 @@ class Trainer:
         self.seed = None
         self.resume_from = None
         self.allow_skip_batches_on_resume = True
+        #: Upload even when the executor's torch series differs. The job is a
+        #: pickled object graph, so this usually fails at unpickle time.
+        self.allow_torch_mismatch = False
         #: Extra directories whose modules should travel by value.
         self.ship_modules = []
 

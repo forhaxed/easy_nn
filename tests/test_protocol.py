@@ -188,3 +188,38 @@ def test_a_local_executor_still_completes_the_setup_step():
     thread.join(timeout=10)
 
     assert seen == [[]], "nothing to install locally"
+
+
+def test_a_torch_mismatch_is_refused_before_the_upload():
+    """cloudpickle records submodules it thinks the code needs -- an attribute
+    called `accelerator` is enough to pull in torch.accelerator, which exists
+    only from torch 2.6. Unpickling then dies, but only after the whole model
+    has been sent. So the versions get compared first."""
+    from easy_nn.client.session import RemoteError, _check_torch_match
+
+    with pytest.raises(RemoteError, match="torch mismatch"):
+        _check_torch_match("2.4.1+cu124")
+
+    message = None
+    try:
+        _check_torch_match("2.4.1+cu124")
+    except RemoteError as exc:
+        message = str(exc)
+    assert "2.4.1+cu124" in message
+    assert torch.__version__ in message
+    assert "before easy-nn-server starts" in message
+
+
+def test_the_same_torch_series_is_accepted():
+    from easy_nn.client.session import _check_torch_match
+
+    series = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+    _check_torch_match(f"{series}.99+cpu")       # patch differences are fine
+    _check_torch_match(torch.__version__)
+    _check_torch_match(None)                     # an old executor says nothing
+
+
+def test_the_mismatch_check_can_be_overridden():
+    from easy_nn.client.session import _check_torch_match
+
+    _check_torch_match("1.13.0", allow_mismatch=True)

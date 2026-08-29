@@ -70,7 +70,7 @@ def run_job(trainer, executor):
     feeder = None
 
     try:
-        _handshake(channel, executor, console)
+        _handshake(channel, executor, console, trainer)
         _install_requirements(trainer, executor, channel, console)
         _send_job(trainer, channel, console)
 
@@ -102,7 +102,7 @@ def run_job(trainer, executor):
 # ======================================================================
 #  Setup
 # ======================================================================
-def _handshake(channel, executor, console):
+def _handshake(channel, executor, console, trainer=None):
     import easy_nn
 
     channel.send(
@@ -136,6 +136,44 @@ def _handshake(channel, executor, console):
             f"{easy_nn.__version__}. Restart the pod to pick up your changes."
             f"{Style.RESET_ALL}\n"
         )
+
+    _check_torch_match(
+        reply.meta.get("torch"),
+        allow_mismatch=getattr(trainer, "allow_torch_mismatch", False),
+    )
+
+
+def _check_torch_match(theirs, allow_mismatch=False):
+    """Refuse to upload weights into a torch that cannot unpickle them.
+
+    The job is a pickled object graph built by the local torch, and cloudpickle
+    records the submodules it believes the code needs -- including ones that
+    only exist in newer releases. Those imports run on the executor, so a torch
+    that is even a minor version behind fails at unpickle time, which is after
+    the whole model has been uploaded. Check first.
+    """
+    import torch
+
+    if not theirs or allow_mismatch:
+        return
+
+    def series(version):
+        return tuple(version.split("+")[0].split(".")[:2])
+
+    ours = torch.__version__
+    if series(theirs) == series(ours):
+        return
+
+    raise RemoteError(
+        f"torch mismatch: this machine has {ours}, the executor has {theirs}.\n"
+        "The job travels as a pickled object graph, so the executor has to "
+        "unpickle it with a matching torch -- otherwise it fails only after the "
+        "whole model has been uploaded.\n"
+        f"Fix the pod's start command to install torch=={ours.split('+')[0]} "
+        "before easy-nn-server starts (installing it later is too late: the "
+        "server has already imported torch).\n"
+        "Set trainer.allow_torch_mismatch = True to try anyway."
+    )
 
 
 def _await(channel, console, expected):
