@@ -335,3 +335,27 @@ def test_the_handshake_declares_the_environment_it_needs():
     spec = local_env_spec(T())
     assert set(spec) >= {"python", "torch", "requirements"}
     assert spec["requirements"] == ["diffusers==0.37.1"]
+
+
+def test_bandwidth_is_measured_over_a_window_not_between_samples():
+    """Work is sent in batches: one step in eight carries an upload and the
+    rest carry nothing. An instantaneous rate reads zero almost always."""
+    from easy_nn.client.session import _NetworkMeter
+
+    class Counter:
+        bytes_sent = 0
+        bytes_received = 0
+
+    transport = Counter()
+    meter = _NetworkMeter(transport, window=60.0)
+
+    # One burst, then several quiet samples -- as a real feeder behaves.
+    transport.bytes_sent = 80_000_000
+    first = meter.sample()
+    quiet = [meter.sample() for _ in range(5)]
+
+    assert first["net/up_MBps"] > 0
+    assert all(s["net/up_MBps"] > 0 for s in quiet), (
+        "the burst must still count; a quiet step is not a dead link"
+    )
+    assert quiet[-1]["net/up_total_GB"] == pytest.approx(80_000_000 / (1 << 30))

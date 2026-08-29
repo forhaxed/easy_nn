@@ -8,6 +8,7 @@ decides *what* exists -- the data, the logs, the checkpoints.
 
 from __future__ import annotations
 
+import collections
 import importlib.util
 import itertools
 import json
@@ -535,29 +536,42 @@ def _pump(state, console, board, checkpoints, reporter):
 
 
 class _NetworkMeter:
-    """Turns the transport's byte counters into rates."""
+    """Turns the transport's byte counters into rates.
 
-    def __init__(self, transport):
+    Measured over a window rather than between samples: work is sent in
+    batches, so one step in eight carries a whole upload and the rest carry
+    nothing. Instantaneous rates would read zero almost always and spike
+    absurdly once -- useless for telling whether the link is the bottleneck.
+    """
+
+    def __init__(self, transport, window=20.0):
         self.transport = transport
-        self._last = time.perf_counter()
-        self._sent = self._read("bytes_sent")
-        self._received = self._read("bytes_received")
+        self.window = window
+        self._history = collections.deque()
+        self._record()
 
     def _read(self, attribute):
         return float(getattr(self.transport, attribute, 0) or 0)
 
-    def sample(self) -> dict:
+    def _record(self):
         now = time.perf_counter()
-        sent, received = self._read("bytes_sent"), self._read("bytes_received")
-        span = max(now - self._last, 1e-6)
-        rates = {
-            "net/up_MBps": (sent - self._sent) / span / 1e6,
-            "net/down_MBps": (received - self._received) / span / 1e6,
+        self._history.append(
+            (now, self._read("bytes_sent"), self._read("bytes_received"))
+        )
+        while len(self._history) > 2 and now - self._history[0][0] > self.window:
+            self._history.popleft()
+        return self._history[-1]
+
+    def sample(self) -> dict:
+        now, sent, received = self._record()
+        then, was_sent, was_received = self._history[0]
+        span = max(now - then, 1e-6)
+        return {
+            "net/up_MBps": (sent - was_sent) / span / 1e6,
+            "net/down_MBps": (received - was_received) / span / 1e6,
             "net/up_total_GB": sent / (1 << 30),
             "net/down_total_GB": received / (1 << 30),
         }
-        self._last, self._sent, self._received = now, sent, received
-        return rates
 
 
 def _error_text(message):
