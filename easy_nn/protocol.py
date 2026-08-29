@@ -16,7 +16,7 @@ import pickle
 import struct
 import threading
 
-PROTO_VERSION = 3
+PROTO_VERSION = 4
 
 # Message types (header frames)
 HELLO = 1
@@ -38,6 +38,7 @@ PONG = 17
 ARTIFACT = 18
 SETUP = 19
 READY = 20
+RESTART = 21
 
 # Raw payload frame, always preceded by a header frame that announces it.
 PART = 0xF0

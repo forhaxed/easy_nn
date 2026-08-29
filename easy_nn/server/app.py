@@ -57,15 +57,32 @@ def serve_tcp(host: str, port: int, token: str | None, once: bool = False):
     _announce(port)
     while True:
         channel = listener.accept()
+        runner = Runner(channel, token=token)
         served = False
         try:
-            served = Runner(channel, token=token).serve_one_job()
+            served = runner.serve_one_job()
         except Exception as exc:  # noqa: BLE001 - one bad client must not end the server
             print(f"connection failed: {exc!r}", file=sys.stderr)
         finally:
             channel.close()
+
+        if runner.restart_with:
+            _restart_into(runner.restart_with, listener)
         if once and served:
             return
+
+
+def _restart_into(python: str, listener):
+    """Replace this process with the same server on another interpreter.
+
+    A running process cannot change the Python it is using, so the only way to
+    honour a job's environment is to hand over to one that can.  The listening
+    socket is closed first so the port is free the moment the new server binds.
+    """
+    listener.close()
+    print(f"restarting under {python}", file=sys.stderr)
+    sys.stderr.flush()
+    os.execv(python, [python, "-m", "easy_nn.server.app", *sys.argv[1:]])
 
 
 def _announce(port: int):

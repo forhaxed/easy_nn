@@ -30,6 +30,46 @@ class RemoteError(RuntimeError):
     """The executor raised.  The traceback below happened over there."""
 
 
+class ExecutorRestarted(RuntimeError):
+    """The executor built the environment the job needs and restarted into it.
+
+    Not a failure: nothing was uploaded, and the environment is cached. Run the
+    script again.
+    """
+
+
+def local_env_spec(trainer=None) -> dict:
+    """Describe the environment the executor has to reproduce.
+
+    Python has to match to the minor version because the trainer's methods
+    travel as bytecode; torch has to match because cloudpickle records torch
+    submodules that only exist in some releases; torchvision has to match torch
+    or it dies registering its operators, and transformers imports it for you.
+    """
+    import platform
+
+    import torch
+
+    spec = {
+        "python": ".".join(platform.python_version().split(".")[:2]),
+        "torch": torch.__version__.split("+")[0],
+        "requirements": list(getattr(trainer, "requirements", []) or []),
+    }
+
+    build = torch.__version__.split("+")[1] if "+" in torch.__version__ else ""
+    if build:
+        spec["torch_index"] = f"https://download.pytorch.org/whl/{build}"
+
+    try:
+        import torchvision
+
+        spec["torchvision"] = torchvision.__version__.split("+")[0]
+    except Exception:
+        pass
+
+    return spec
+
+
 class _Compressor:
     """Decides once whether compressing payloads is worth it, then sticks."""
 
@@ -113,13 +153,12 @@ def _handshake(channel, executor, console, trainer=None):
             "proto": protocol.PROTO_VERSION,
             "token": getattr(executor, "token", None),
             "easy_nn": easy_nn.__version__,
+            # The executor builds this if it does not already have it.
+            "env": local_env_spec(trainer),
         },
     )
-    reply = channel.recv()
-    if reply.type == protocol.ERROR:
-        raise RemoteError(_error_text(reply))
-    if reply.type != protocol.WELCOME:
-        raise protocol.ProtocolError(f"unexpected greeting {reply!r}")
+    # Building an environment can take minutes and reports as it goes.
+    reply = _await(channel, console, protocol.WELCOME)
 
     console.text(
         f"{Fore.BLUE}Executor:{Style.RESET_ALL} {executor.describe()} "
@@ -210,6 +249,8 @@ def _await(channel, console, expected):
         if message.type == protocol.PRINT:
             console.text(message.meta["text"])
             continue
+        if message.type == protocol.RESTART:
+            raise ExecutorRestarted(message.meta.get("message", "executor restarted"))
         if message.type == protocol.ERROR:
             raise RemoteError(_error_text(message))
         raise protocol.ProtocolError(f"unexpected reply {message!r}")

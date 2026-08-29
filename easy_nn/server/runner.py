@@ -22,6 +22,8 @@ class Runner:
         self.token = token
         self.feed = None
         self.link = None
+        #: Set when the job needs an interpreter this process is not running.
+        self.restart_with = None
         self._reader = None
         self._stopped = threading.Event()
 
@@ -57,6 +59,14 @@ class Runner:
         if self.token is not None and hello.meta.get("token") != self.token:
             self.channel.send(protocol.ERROR, {"message": "bad token"})
             return False
+
+        # Build whatever environment the job asks for before doing anything
+        # else. The pod's image is whatever was free; the job needs a specific
+        # Python and torch, and it is cheaper to make one than to make the user
+        # go shopping for images.
+        if self._prepare_environment(hello.meta.get("env")):
+            return False
+
         self.channel.send(
             protocol.WELCOME, {"proto": protocol.PROTO_VERSION, **_environment()}
         )
@@ -95,6 +105,42 @@ class Runner:
             self.channel.send(protocol.ERROR, {"traceback": traceback.format_exc()})
         finally:
             self._stopped.set()
+        return True
+
+    # ------------------------------------------------------------------
+    def _prepare_environment(self, spec) -> bool:
+        """Return True when the server has to restart into a new environment."""
+        if not spec:
+            return False
+
+        from easy_nn.server import bootstrap
+
+        say = lambda text: self.channel.send(protocol.PRINT, {"text": text})
+        if bootstrap.satisfied_by_current(spec):
+            return False
+
+        try:
+            python = bootstrap.ensure_interpreter(spec, say=say)
+        except BaseException:
+            self.channel.send(protocol.ERROR, {"traceback": traceback.format_exc()})
+            return True
+
+        # The interpreter cannot be swapped under a running process, so the
+        # server re-executes itself. The job has to be sent again -- nothing has
+        # been uploaded yet, so that costs a second run and no bandwidth.
+        self.restart_with = python
+        self.channel.send(
+            protocol.RESTART,
+            {
+                "python": python,
+                "message": (
+                    "The executor built the environment this job needs "
+                    f"(python {spec.get('python')}, torch {spec.get('torch')}) "
+                    "and is restarting into it. Run your script again -- the "
+                    "environment is cached, so this happens once."
+                ),
+            },
+        )
         return True
 
     # ------------------------------------------------------------------

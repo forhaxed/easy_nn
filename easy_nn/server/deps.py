@@ -19,12 +19,31 @@ STAMP_DIR = os.environ.get(
 )
 
 
-def _key(requirements) -> str:
-    joined = "\n".join(sorted(requirements))
-    return hashlib.sha256(joined.encode()).hexdigest()[:16]
+def _key(requirements, interpreter=None) -> str:
+    """Identify an install by its packages *and* the environment they go into.
+
+    The same pod can run the server from the image's Python one day and from a
+    venv the next; $HOME does not change, so a stamp keyed on the package list
+    alone would claim the venv already has them.
+    """
+    fingerprint = "\n".join([interpreter or sys.executable, *sorted(requirements)])
+    return hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
 
 
-def ensure(requirements, report=None) -> bool:
+def mark_installed(requirements, interpreter) -> None:
+    """Record that ``interpreter`` already has these, so it skips reinstalling.
+
+    The bootstrap installs a job's packages while building the venv; the server
+    that later runs inside it should not repeat the work.
+    """
+    if not requirements:
+        return
+    os.makedirs(STAMP_DIR, exist_ok=True)
+    with open(os.path.join(STAMP_DIR, _key(requirements, interpreter)), "w") as handle:
+        handle.write("\n".join(sorted(requirements)))
+
+
+def ensure(requirements, report=None, force=False) -> bool:
     """Install ``requirements`` unless this exact set was installed before.
 
     Returns True if pip actually ran.
@@ -34,7 +53,7 @@ def ensure(requirements, report=None) -> bool:
 
     say = report or (lambda text: None)
     stamp = os.path.join(STAMP_DIR, _key(requirements))
-    if os.path.exists(stamp):
+    if os.path.exists(stamp) and not force:
         say(f"Dependencies already installed ({len(requirements)} packages).\n")
         return False
 

@@ -1,35 +1,78 @@
 Paste this into the RunPod template's "Container Start Command" field.
 
-Replace YOUR_GITHUB and YOUR_SECRET.  Nothing else about the pod needs setting
-up: the job carries its own code, its own weights and its own package list.
+Replace YOUR_GITHUB and YOUR_SECRET. That is the whole setup:
 
-  bash -lc "pip install --no-cache-dir git+https://github.com/YOUR_GITHUB/easy_nn && EASY_NN_TOKEN=YOUR_SECRET easy-nn-server --port 70000"
+  bash -lc "pip install --no-cache-dir git+https://github.com/YOUR_GITHUB/easy_nn && EASY_NN_TOKEN=YOUR_SECRET easy-nn-server --port 7654"
+
+Take any image and any GPU that is free. The image's Python and torch do not
+matter -- the server builds what each job asks for.
 
 Template settings that matter:
 
-  Container Image     runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-                      (any recent runpod/pytorch works; easy_nn does not care)
-  Expose TCP Ports    70000
+  Container Image     any recent runpod/pytorch; the version is not important
+  Expose TCP Ports    7654
   Public IP           required -- pick a machine that offers one
 
-Pick a port above 70000.  RunPod normally maps your container port to some
-unrelated external one (7654 might come out as 41234), but for ports above
-70000 it allocates a matching pair, so the number you dial is the number you
-configured.  Either way the container is told the truth through
-RUNPOD_PUBLIC_IP and RUNPOD_TCP_PORT_<port>, and the server prints the
-resulting address on startup:
 
-  easy_nn executor listening on port 70000
-    connect with: RunPod(host='194.26.196.4', port=70000)
+HOW THE ENVIRONMENT GETS SORTED OUT
+
+The client describes what it needs in the handshake: its Python minor version,
+its torch and torchvision, and the job's requirements. If the running server
+already satisfies that, it just accepts the job. If not, it builds a venv that
+does -- `uv` downloads a standalone CPython when the image has no suitable one
+-- restarts itself into it, and tells you to run the script again:
+
+  The executor built the environment this job needs (python 3.11, torch 2.10.0)
+  and is restarting into it. Run your script again -- the environment is
+  cached, so this happens once.
+
+Nothing has been uploaded at that point, so the second run costs no bandwidth.
+Environments are cached under ~/.easy_nn/envs, keyed by the exact
+specification, so it is a one-time cost per pod per configuration.
+
+Why it has to match at all, rather than being close enough:
+
+* Python, to the minor version. Your trainer's methods travel as code objects
+  -- raw bytecode -- and bytecode is specific to the interpreter that produced
+  it. A mismatch does not fail cleanly; it misexecutes, and a line like
+  `assert self.batch_size == 1` comes back as "too many values to unpack".
+* torch, to the minor version. cloudpickle records the torch submodules it
+  believes your code needs, and some exist only in newer releases -- an
+  attribute named `accelerator` on your trainer is enough to pull in
+  `torch.accelerator`, which arrived in torch 2.6.
+* torchvision, paired with torch. One built against a different torch imports
+  fine and then dies registering `torchvision::nms`, and transformers imports
+  it whether your job uses it or not.
+
+Before accepting a job the executor also imports the whole declared stack, so a
+broken install surfaces in a second rather than after a multi-gigabyte upload.
+
+
+FINDING THE ADDRESS
+
+The port you dial is NOT the port you configured.  RunPod maps container port
+7654 to some unrelated external one -- 41234, say -- on a public IP.  You have
+to look the pair up; there is no way to predict it.
+
+(RunPod's docs describe entering a number above 70000 as a signal to allocate a
+matching internal/external pair.  The console validates the field as a real
+port, 0-65535, and rejects that, so treat the trick as unavailable.)
+
+The server prints the answer on startup, because the container is told through
+RUNPOD_PUBLIC_IP and RUNPOD_TCP_PORT_7654:
+
+  easy_nn executor listening on port 7654
+    torch 2.10.0+cu128 | python 3.11.9 | easy_nn 0.1.0
+    connect with: RunPod(host='194.26.196.4', port=41234)
 
 To read it yourself, open the pod's Connect menu and look under "Direct TCP
 Ports", or run this in the pod's terminal:
 
-  echo $RUNPOD_PUBLIC_IP $RUNPOD_TCP_PORT_70000
+  echo $RUNPOD_PUBLIC_IP $RUNPOD_TCP_PORT_7654
 
 Use exactly that in your script:
 
-  t.train(on=RunPod(host="194.26.196.4", port=70000, token="YOUR_SECRET"))
+  t.train(on=RunPod(host="194.26.196.4", port=41234, token="YOUR_SECRET"))
 
 Notes
 

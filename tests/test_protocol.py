@@ -309,3 +309,29 @@ def test_python_is_checked_before_torch():
 
     with pytest.raises(RemoteError, match="Python mismatch"):
         _check_compatibility("2.7.0", "1.13.0")
+
+
+def test_a_restart_is_reported_as_such_not_as_a_failure():
+    """Building an environment is not an error: nothing has been uploaded, and
+    the next run finds it cached."""
+    from easy_nn.client.session import ExecutorRestarted, _await
+    from easy_nn.client.sinks import ConsoleSink
+
+    left, right = make_pair()
+    left.send(protocol.PRINT, {"text": "  installing torch...\n"})
+    left.send(protocol.RESTART, {"python": "/opt/easynn/bin/python",
+                                 "message": "Run your script again."})
+
+    with pytest.raises(ExecutorRestarted, match="Run your script again"):
+        _await(right, ConsoleSink(enabled=False), protocol.WELCOME)
+
+
+def test_the_handshake_declares_the_environment_it_needs():
+    from easy_nn.client.session import local_env_spec
+
+    class T:
+        requirements = ["diffusers==0.37.1"]
+
+    spec = local_env_spec(T())
+    assert set(spec) >= {"python", "torch", "requirements"}
+    assert spec["requirements"] == ["diffusers==0.37.1"]
