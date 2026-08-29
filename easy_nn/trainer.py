@@ -113,9 +113,10 @@ class Trainer:
         self.seed = None
         self.resume_from = None
         self.allow_skip_batches_on_resume = True
-        #: Upload even when the executor's torch series differs. The job is a
-        #: pickled object graph, so this usually fails at unpickle time.
-        self.allow_torch_mismatch = False
+        #: Upload even when the executor's Python or torch series differs.
+        #: Both normally fail only after the whole model has been sent, and a
+        #: Python mismatch misexecutes bytecode rather than failing cleanly.
+        self.allow_version_mismatch = False
         #: Modules the executor must import before the job is sent. None means
         #: derive them from ``requirements``; set a list to override.
         self.verify_imports = None

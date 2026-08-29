@@ -139,43 +139,62 @@ def _handshake(channel, executor, console, trainer=None):
             f"{Style.RESET_ALL}\n"
         )
 
-    _check_torch_match(
+    _check_compatibility(
+        reply.meta.get("python"),
         reply.meta.get("torch"),
-        allow_mismatch=getattr(trainer, "allow_torch_mismatch", False),
+        allow_mismatch=getattr(trainer, "allow_version_mismatch", False),
     )
 
 
-def _check_torch_match(theirs, allow_mismatch=False):
-    """Refuse to upload weights into a torch that cannot unpickle them.
+def _series(version):
+    return tuple(version.split("+")[0].split(".")[:2])
 
-    The job is a pickled object graph built by the local torch, and cloudpickle
-    records the submodules it believes the code needs -- including ones that
-    only exist in newer releases. Those imports run on the executor, so a torch
-    that is even a minor version behind fails at unpickle time, which is after
-    the whole model has been uploaded. Check first.
+
+def _check_compatibility(their_python, their_torch, allow_mismatch=False):
+    """Refuse to upload into an environment that cannot run what we send.
+
+    Both checks guard the same failure shape: the job is only unpickled once
+    the whole model has arrived, so an incompatibility discovered there costs
+    the entire upload. A second spent here saves it.
     """
+    import platform
+
     import torch
 
-    if not theirs or allow_mismatch:
+    if allow_mismatch:
         return
 
-    def series(version):
-        return tuple(version.split("+")[0].split(".")[:2])
+    # Python first, and it is the strict one. cloudpickle ships your methods as
+    # code objects -- raw bytecode -- and bytecode is specific to the
+    # interpreter that produced it. Run 3.11 bytecode on 3.12 and the opcodes
+    # no longer mean what they meant: you get nonsense errors from innocent
+    # lines, like an assert reporting "too many values to unpack".
+    ours = platform.python_version()
+    if their_python and _series(their_python) != _series(ours):
+        raise RemoteError(
+            f"Python mismatch: this machine runs {ours}, the executor runs "
+            f"{their_python}.\n"
+            "Your trainer's methods travel as bytecode, which only the same "
+            "Python minor version can execute. A mismatch does not fail "
+            "cleanly -- it misexecutes, and the errors make no sense.\n"
+            f"Use a pod image built on Python {'.'.join(_series(ours))}.\n"
+            "Set trainer.allow_version_mismatch = True to try anyway."
+        )
 
     ours = torch.__version__
-    if series(theirs) == series(ours):
-        return
-
-    raise RemoteError(
-        f"torch mismatch: this machine has {ours}, the executor has {theirs}.\n"
-        "The job travels as a pickled object graph, so the executor has to "
-        "unpickle it with a matching torch -- otherwise it fails only after the "
-        "whole model has been uploaded.\n"
-        f"Fix the pod's start command to install torch=={ours.split('+')[0]} "
-        "before easy-nn-server starts (installing it later is too late: the "
-        "server has already imported torch).\n"
-        "Set trainer.allow_torch_mismatch = True to try anyway."
-    )
+    if their_torch and _series(their_torch) != _series(ours):
+        raise RemoteError(
+            f"torch mismatch: this machine has {ours}, the executor has "
+            f"{their_torch}.\n"
+            "The job is a pickled object graph, and cloudpickle records the "
+            "torch submodules it thinks your code needs -- some of which only "
+            "exist in newer releases.\n"
+            f"Install torch=={ours.split('+')[0]} (with the matching "
+            "torchvision) in the pod's start command, before easy-nn-server "
+            "starts: installing it later is too late, the server has already "
+            "imported torch.\n"
+            "Set trainer.allow_version_mismatch = True to try anyway."
+        )
 
 
 def _await(channel, console, expected):

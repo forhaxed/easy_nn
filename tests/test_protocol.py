@@ -195,34 +195,34 @@ def test_a_torch_mismatch_is_refused_before_the_upload():
     called `accelerator` is enough to pull in torch.accelerator, which exists
     only from torch 2.6. Unpickling then dies, but only after the whole model
     has been sent. So the versions get compared first."""
-    from easy_nn.client.session import RemoteError, _check_torch_match
+    from easy_nn.client.session import RemoteError, _check_compatibility
 
     with pytest.raises(RemoteError, match="torch mismatch"):
-        _check_torch_match("2.4.1+cu124")
+        _check_compatibility(None, "2.4.1+cu124")
 
     message = None
     try:
-        _check_torch_match("2.4.1+cu124")
+        _check_compatibility(None, "2.4.1+cu124")
     except RemoteError as exc:
         message = str(exc)
     assert "2.4.1+cu124" in message
     assert torch.__version__ in message
-    assert "before easy-nn-server starts" in message
+    assert "before easy-nn-server" in message
 
 
 def test_the_same_torch_series_is_accepted():
-    from easy_nn.client.session import _check_torch_match
+    from easy_nn.client.session import _check_compatibility
 
     series = ".".join(torch.__version__.split("+")[0].split(".")[:2])
-    _check_torch_match(f"{series}.99+cpu")       # patch differences are fine
-    _check_torch_match(torch.__version__)
-    _check_torch_match(None)                     # an old executor says nothing
+    _check_compatibility(None, f"{series}.99+cpu")   # patch differences are fine
+    _check_compatibility(None, torch.__version__)
+    _check_compatibility(None, None)                 # an old executor says nothing
 
 
 def test_the_mismatch_check_can_be_overridden():
-    from easy_nn.client.session import _check_torch_match
+    from easy_nn.client.session import _check_compatibility
 
-    _check_torch_match("1.13.0", allow_mismatch=True)
+    _check_compatibility("3.7.0", "1.13.0", allow_mismatch=True)
 
 
 def test_setup_names_the_modules_the_executor_must_import():
@@ -270,3 +270,42 @@ def test_a_healthy_environment_reports_what_it_verified():
     message = left.recv()
     assert message.type == protocol.PRINT
     assert "Verified imports: torch, json" in message.meta["text"]
+
+
+def test_a_python_mismatch_is_refused_before_the_upload():
+    """cloudpickle ships methods as bytecode, and bytecode is tied to the
+    interpreter that produced it. Running 3.11 bytecode under 3.12 does not
+    fail cleanly -- it misexecutes, and an innocent `assert x == 1` reports
+    'too many values to unpack'. That has to be caught before the upload."""
+    import platform
+
+    from easy_nn.client.session import RemoteError, _check_compatibility
+
+    ours = platform.python_version()
+    major, minor = ours.split(".")[:2]
+    theirs = f"{major}.{int(minor) + 1}.0"
+
+    with pytest.raises(RemoteError, match="Python mismatch") as excinfo:
+        _check_compatibility(theirs, torch.__version__)
+
+    message = str(excinfo.value)
+    assert theirs in message and ours in message
+    assert f"Python {major}.{minor}" in message, "must name the version to use"
+
+
+def test_a_matching_python_passes():
+    import platform
+
+    from easy_nn.client.session import _check_compatibility
+
+    major, minor = platform.python_version().split(".")[:2]
+    # A different patch release is fine; bytecode is stable within a minor.
+    _check_compatibility(f"{major}.{minor}.99", torch.__version__)
+
+
+def test_python_is_checked_before_torch():
+    """Both are wrong here; the report has to name the fatal one."""
+    from easy_nn.client.session import RemoteError, _check_compatibility
+
+    with pytest.raises(RemoteError, match="Python mismatch"):
+        _check_compatibility("2.7.0", "1.13.0")
